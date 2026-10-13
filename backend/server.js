@@ -123,6 +123,20 @@ app.get('/', (req, res) => {
   res.send('Video downloader backend is running.');
 });
 
+function describeFailure(stderr, fallback) {
+  const text = String(stderr || '');
+  if (/HTTP Error (429|403)|too many requests|not a bot|sign in to confirm/i.test(text)) {
+    return 'The video site is refusing requests from this server right now, so this link cannot be downloaded here. Please try again later or use a link from another site.';
+  }
+  if (/private video|this video is private|login required/i.test(text)) {
+    return 'This video appears to be private or requires login, so it cannot be downloaded.';
+  }
+  if (/ffmpeg/i.test(text) && /not found|not installed/i.test(text)) {
+    return 'ffmpeg is not installed on the server, so video and audio cannot be combined.';
+  }
+  return fallback;
+}
+
 function sizeOf(f, duration) {
   if (f.filesize) return { bytes: f.filesize, approx: false };
   if (f.filesize_approx) return { bytes: f.filesize_approx, approx: true };
@@ -214,9 +228,9 @@ app.post('/api/info', rateLimit('info', 20, 60 * 1000), (req, res) => {
   execFile('yt-dlp', args, { maxBuffer: 1024 * 1024 * 10, timeout: 60 * 1000 }, (err, stdout, stderr) => {
     if (err) {
       console.error('yt-dlp info error:', stderr);
-      return res
-        .status(500)
-        .json({ error: 'Could not fetch video info. The link may be private, invalid, or unsupported.' });
+      return res.status(500).json({
+        error: describeFailure(stderr, 'Could not fetch video info. The link may be private, invalid, or unsupported.')
+      });
     }
 
     try {
@@ -360,10 +374,7 @@ function runJob(job, url, formatId, hasAudio) {
 
     if (code !== 0) {
       console.error('yt-dlp download error:', stderr);
-      const message = /private|login|sign in/i.test(stderr)
-        ? 'This video appears to be private or requires login, so it cannot be downloaded.'
-        : 'Download failed. The link may be unavailable or unsupported.';
-      failJob(job, message);
+      failJob(job, describeFailure(stderr, 'Download failed. The link may be unavailable or unsupported.'));
       return;
     }
 
