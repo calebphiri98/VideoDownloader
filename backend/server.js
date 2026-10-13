@@ -47,22 +47,40 @@ app.disable('x-powered-by');
 app.use(cors({ origin: ALLOWED_ORIGIN === '*' ? true : ALLOWED_ORIGIN.split(',') }));
 app.use(express.json({ limit: '10kb' }));
 
-app.get('/api/diagnostics/ytdlp', (req, res) => {
-  execFile('yt-dlp', ['--version'], { timeout: 10000 }, (err, stdout) => {
-    if (err) {
-      console.error('yt-dlp version check failed:', err.message);
-      return res.status(500).json({
-        success: false,
-        error: 'Could not check yt-dlp version'
-      });
-    }
 
-    res.json({
-      success: true,
-      ytDlpVersion: stdout.trim()
+app.get('/api/diagnostics/ytdlp', async (req, res) => {
+  function checkVersion(command, args = []) {
+    return new Promise((resolve) => {
+      execFile(command, args, { timeout: 10000 }, (err, stdout) => {
+        resolve({
+          available: !err,
+          version: err ? null : stdout.trim(),
+          error: err ? err.message : null
+        });
+      });
     });
+  }
+
+  const [ytDlp, deno, ffmpeg] = await Promise.all([
+    checkVersion('yt-dlp', ['--version']),
+    checkVersion('deno', ['--version']),
+    checkVersion(ffmpegBinary(), ['-version'])
+  ]);
+
+  res.json({
+    success: ytDlp.available,
+    ytDlpVersion: ytDlp.version,
+    denoAvailable: deno.available,
+    denoVersion: deno.version,
+    ffmpegAvailable: ffmpeg.available,
+    errors: {
+      ytDlp: ytDlp.error,
+      deno: deno.error,
+      ffmpeg: ffmpeg.error
+    }
   });
 });
+
 
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
