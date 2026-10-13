@@ -12,10 +12,18 @@ const PORT = process.env.PORT || 5000;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 const MAX_ACTIVE_JOBS = 3;
 const JOB_TTL_MS = 30 * 60 * 1000;
+
 const EXTRACTOR_ARGS = process.env.YTDLP_EXTRACTOR_ARGS || '';
+const YTDLP_JS_RUNTIME = process.env.YTDLP_JS_RUNTIME || 'deno';
 
 function extractorArgs() {
-  return EXTRACTOR_ARGS ? ['--extractor-args', EXTRACTOR_ARGS] : [];
+  const args = ['--js-runtimes', YTDLP_JS_RUNTIME];
+
+  if (EXTRACTOR_ARGS) {
+    args.push('--extractor-args', EXTRACTOR_ARGS);
+  }
+
+  return args;
 }
 
 const FFMPEG_LOCATION = process.env.FFMPEG_LOCATION || '';
