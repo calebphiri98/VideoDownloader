@@ -38,6 +38,24 @@ app.set('trust proxy', 1);
 app.disable('x-powered-by');
 app.use(cors({ origin: ALLOWED_ORIGIN === '*' ? true : ALLOWED_ORIGIN.split(',') }));
 app.use(express.json({ limit: '10kb' }));
+
+app.get('/api/diagnostics/ytdlp', (req, res) => {
+  execFile('yt-dlp', ['--version'], { timeout: 10000 }, (err, stdout) => {
+    if (err) {
+      console.error('yt-dlp version check failed:', err.message);
+      return res.status(500).json({
+        success: false,
+        error: 'Could not check yt-dlp version'
+      });
+    }
+
+    res.json({
+      success: true,
+      ytDlpVersion: stdout.trim()
+    });
+  });
+});
+
 app.use((req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
   next();
