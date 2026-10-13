@@ -167,19 +167,33 @@ app.get('/', (req, res) => {
   res.send('Video downloader backend is running.');
 });
 
+
 function describeFailure(stderr, fallback) {
   const text = String(stderr || '');
-  if (/HTTP Error (429|403)|too many requests|not a bot|sign in to confirm/i.test(text)) {
-    return 'The video site is refusing requests from this server right now, so this link cannot be downloaded here. Please try again later or use a link from another site.';
+
+  if (/HTTP Error 429|too many requests/i.test(text)) {
+    return 'The video source is temporarily rate-limiting requests. Please wait before trying again.';
   }
-  if (/private video|this video is private|login required/i.test(text)) {
-    return 'This video appears to be private or requires login, so it cannot be downloaded.';
+
+  if (/HTTP Error 403|forbidden/i.test(text)) {
+    return 'The video source refused the request. The URL may require different access permissions or may be blocked from this server.';
   }
+
+  if (/private video|this video is private|login required|sign in to confirm/i.test(text)) {
+    return 'This video may be private or require sign-in. Only publicly accessible videos can be processed.';
+  }
+
+  if (/unsupported URL/i.test(text)) {
+    return 'This URL is not supported by the current video extractor.';
+  }
+
   if (/ffmpeg/i.test(text) && /not found|not installed/i.test(text)) {
-    return 'ffmpeg is not installed on the server, so video and audio cannot be combined.';
+    return 'FFmpeg is not installed on the server, so video and audio cannot be combined.';
   }
+
   return fallback;
 }
+
 
 function sizeOf(f, duration) {
   if (f.filesize) return { bytes: f.filesize, approx: false };
@@ -270,12 +284,16 @@ app.post('/api/info', rateLimit('info', 20, 60 * 1000), (req, res) => {
   const args = [...extractorArgs(), '--no-playlist', '--dump-json', '--', url];
 
   execFile('yt-dlp', args, { maxBuffer: 1024 * 1024 * 10, timeout: 60 * 1000 }, (err, stdout, stderr) => {
-    if (err) {
-      console.error('yt-dlp info error:', stderr);
-      return res.status(500).json({
-        error: describeFailure(stderr, 'Could not fetch video info. The link may be private, invalid, or unsupported.')
-      });
-    }
+  if (err) {
+  console.error('yt-dlp info error:', stderr || err.message);
+
+  return res.status(422).json({
+    error: describeFailure(
+      stderr || err.message,
+      'Could not fetch video information. This link may be unsupported, unavailable, or blocked by the source.'
+    )
+  });
+}
 
     try {
       const data = JSON.parse(stdout);
