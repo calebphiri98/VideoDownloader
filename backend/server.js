@@ -1,4 +1,4 @@
-﻿const express = require('express');
+const express = require('express');
 const cors = require('cors');
 const { execFile, spawn } = require('child_process');
 const fs = require('fs');
@@ -137,19 +137,52 @@ function isPrivateHost(host) {
   return false;
 }
 
+const DEFAULT_ALLOWED_HOSTS = [
+  'youtube.com',
+  'youtu.be',
+  'facebook.com',
+  'fb.watch',
+  'instagram.com',
+  'tiktok.com',
+  'interactive-examples.mdn.mozilla.net'
+];
+
+const ALLOWED_VIDEO_HOSTS = [
+  ...DEFAULT_ALLOWED_HOSTS,
+  ...(process.env.ALLOWED_VIDEO_HOSTS || '')
+    .split(',')
+    .map((host) => host.trim().toLowerCase())
+    .filter(Boolean)
+];
+
+function isAllowedVideoHost(hostname) {
+  const host = hostname.toLowerCase();
+
+  return ALLOWED_VIDEO_HOSTS.some((allowed) =>
+    host === allowed || host.endsWith(`.${allowed}`)
+  );
+}
+
 function validateUrl(value) {
-  if (typeof value !== 'string' || value.length === 0 || value.length > 2048) return null;
+  if (typeof value !== 'string' || value.length === 0 || value.length > 2048) {
+    return null;
+  }
+
   let parsed;
+
   try {
     parsed = new URL(value.trim());
   } catch {
     return null;
   }
-  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
-  if (isPrivateHost(parsed.hostname.toLowerCase())) return null;
+
+  if (parsed.protocol !== 'https:') return null;
+  if (parsed.username || parsed.password) return null;
+  if (parsed.port && parsed.port !== '443') return null;
+  if (!isAllowedVideoHost(parsed.hostname)) return null;
+
   return parsed.href;
 }
-
 function sanitizeFilename(name) {
   if (!name || typeof name !== 'string') return 'video';
   return (
@@ -765,9 +798,3 @@ checkFfmpeg().then((ok) => {
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
-
-
-
-
-
-
