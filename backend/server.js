@@ -278,17 +278,57 @@ function buildOptions(data) {
     .sort((a, b) => b.height - a.height);
 }
 
+const YOUTUBE_COOLDOWN_MS = 15 * 60 * 1000;
+let youtubeCooldownUntil = 0;
+
+function isYouTubeSource(url) {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host === 'youtu.be' || host === 'youtube.com' || host.endsWith('.youtube.com');
+  } catch {
+    return false;
+  }
+}
+
+function isYouTubeThrottle(message) {
+  return /HTTP Error 429|too many requests|sign in to confirm you.re not a bot/i.test(String(message || ''));
+}
+
+function youtubeCooldownActive(url) {
+  return isYouTubeSource(url) && Date.now() < youtubeCooldownUntil;
+}
+
+function recordYouTubeThrottle(url, message) {
+  if (!isYouTubeSource(url) || !isYouTubeThrottle(message)) return false;
+  youtubeCooldownUntil = Math.max(youtubeCooldownUntil, Date.now() + YOUTUBE_COOLDOWN_MS);
+  console.warn('YouTube cooldown activated until:', new Date(youtubeCooldownUntil).toISOString());
+  return true;
+}
+
+function sendYouTubeCooldown(res) {
+  const seconds = Math.max(1, Math.ceil((youtubeCooldownUntil - Date.now()) / 1000));
+  res.setHeader('Retry-After', String(seconds));
+  return res.status(429).json({
+    error: 'YouTube is temporarily restricting requests from this server. Please try again later.',
+    retryAfterSeconds: seconds
+  });
+}
 app.post('/api/info', rateLimit('info', 20, 60 * 1000), (req, res) => {
   const url = validateUrl(req.body && req.body.url);
   if (!url) {
     return res.status(400).json({ error: 'Please provide a valid public http or https link.' });
   }
 
-  const args = [...extractorArgs(), '--no-playlist', '--dump-json', '--', url];
+  if (youtubeCooldownActive(url)) return sendYouTubeCooldown(res);
+
+const args = [...extractorArgs(), '--no-playlist', '--dump-json', '--', url];
 
   execFile('yt-dlp', args, { maxBuffer: 1024 * 1024 * 10, timeout: 60 * 1000 }, (err, stdout, stderr) => {
   if (err) {
   console.error('yt-dlp info error:', stderr || err.message);
+    if (recordYouTubeThrottle(url, stderr || err.message)) {
+      return sendYouTubeCooldown(res);
+    }
 
   return res.status(422).json({
     error: describeFailure(
@@ -472,6 +512,10 @@ function runJob(job, url, formatId, hasAudio) {
         return;
       }
       console.error('yt-dlp download error:', stderr);
+      if (recordYouTubeThrottle(url, stderr)) {
+        failJob(job, 'YouTube is temporarily restricting requests from this server. Please try again later.');
+        return;
+      }
       failJob(job, describeFailure(stderr, 'Download failed. The link may be unavailable or unsupported.'));
       return;
     }
@@ -509,7 +553,9 @@ app.post('/api/download/start', rateLimit('start', 10, 60 * 1000), (req, res) =>
     return res.status(400).json({ error: 'Please provide a valid public http or https link.' });
   }
 
-  const formatId = body.format_id;
+  if (youtubeCooldownActive(url)) return sendYouTubeCooldown(res);
+
+const formatId = body.format_id;
   if (typeof formatId !== 'string' || !/^[A-Za-z0-9._-]{1,40}$/.test(formatId)) {
     return res.status(400).json({ error: 'Invalid format selected.' });
   }
@@ -713,6 +759,7 @@ checkFfmpeg().then((ok) => {
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
 
 
 
