@@ -1,4 +1,4 @@
-const express = require('express');
+﻿const express = require('express');
 const cors = require('cors');
 const { execFile, spawn } = require('child_process');
 const fs = require('fs');
@@ -10,7 +10,10 @@ const app = express();
 
 const PORT = process.env.PORT || 5000;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
-const MAX_ACTIVE_JOBS = 3;
+const MAX_ACTIVE_JOBS = Math.max(1, Number(process.env.MAX_ACTIVE_JOBS) || 1);
+const DOWNLOAD_DIR = path.join(os.tmpdir(), 'video-downloader');
+const MAX_DOWNLOAD_BYTES = 500 * 1024 * 1024;
+fs.mkdirSync(DOWNLOAD_DIR, { recursive: true });
 const JOB_TTL_MS = 30 * 60 * 1000;
 
 const EXTRACTOR_ARGS = process.env.YTDLP_EXTRACTOR_ARGS || '';
@@ -339,18 +342,34 @@ function publish(job) {
 }
 
 function removeJobFiles(id) {
-  const tempDir = os.tmpdir();
-  let files = [];
+  if (!UUID_PATTERN.test(id)) return;
   try {
-    files = fs.readdirSync(tempDir).filter((f) => f.startsWith(id));
-  } catch {
-    return;
-  }
-  for (const file of files) {
-    fs.unlink(path.join(tempDir, file), () => {});
+    for (const file of fs.readdirSync(DOWNLOAD_DIR)) {
+      if (file.startsWith(`${id}.`)) {
+        try {
+          fs.rmSync(path.join(DOWNLOAD_DIR, file), { force: true });
+        } catch (err) {
+          console.error('File cleanup failed:', err.message);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('Temporary directory error:', err.message);
   }
 }
 
+function temporaryFileSize(id) {
+  let total = 0;
+  try {
+    for (const file of fs.readdirSync(DOWNLOAD_DIR)) {
+      if (file.startsWith(`${id}.`)) {
+        const stat = fs.statSync(path.join(DOWNLOAD_DIR, file));
+        if (stat.isFile()) total += stat.size;
+      }
+    }
+  } catch {}
+  return total;
+}
 function failJob(job, message) {
   job.status = 'error';
   job.error = message;
@@ -362,7 +381,7 @@ function runJob(job, url, formatId, hasAudio) {
   const selector = hasAudio
     ? `${formatId}/best`
     : `${formatId}+bestaudio[ext=m4a]/${formatId}+bestaudio/${formatId}/best`;
-  const outputTemplate = path.join(os.tmpdir(), `${job.id}.%(ext)s`);
+  const outputTemplate = path.join(DOWNLOAD_DIR, `${job.id}.%(ext)s`);
 
   const args = [
     ...extractorArgs(),
@@ -386,6 +405,19 @@ function runJob(job, url, formatId, hasAudio) {
 
   const child = spawn('yt-dlp', args);
   job.child = child;
+  job.limitExceeded = false;
+
+  const sizeMonitor = setInterval(() => {
+    if (!job.limitExceeded && temporaryFileSize(job.id) > MAX_DOWNLOAD_BYTES) {
+      job.limitExceeded = true;
+      console.error(`Download exceeded storage limit: ${job.id}`);
+      child.kill('SIGKILL');
+    }
+  }, 2000);
+
+  sizeMonitor.unref();
+  child.once('close', () => clearInterval(sizeMonitor));
+  child.once('error', () => clearInterval(sizeMonitor));
 
   let buffer = '';
   let stderr = '';
@@ -435,12 +467,16 @@ function runJob(job, url, formatId, hasAudio) {
     if (job.cancelled || isFinished(job)) return;
 
     if (code !== 0) {
+      if (job.limitExceeded) {
+        failJob(job, 'The download exceeds the 500 MB storage limit.');
+        return;
+      }
       console.error('yt-dlp download error:', stderr);
       failJob(job, describeFailure(stderr, 'Download failed. The link may be unavailable or unsupported.'));
       return;
     }
 
-    const produced = fs.readdirSync(os.tmpdir()).filter((f) => f.startsWith(`${job.id}.`) && !f.endsWith('.part'));
+    const produced = fs.readdirSync(DOWNLOAD_DIR).filter((f) => f.startsWith(`${job.id}.`) && !f.endsWith('.part'));
     const merged = produced.filter((f) => !/\.f[\w-]+\.[a-z0-9]+$/i.test(f));
     const file = merged.find((f) => f.endsWith('.mp4')) || merged[0];
     if (!file) {
@@ -453,7 +489,11 @@ function runJob(job, url, formatId, hasAudio) {
       return;
     }
 
-    job.filePath = path.join(os.tmpdir(), file);
+    job.filePath = path.join(DOWNLOAD_DIR, file);
+if (fs.statSync(job.filePath).size > MAX_DOWNLOAD_BYTES) {
+  failJob(job, 'The downloaded file exceeds the maximum allowed size.');
+  return;
+}
     job.status = 'done';
     job.percent = 100;
     job.speed = '';
@@ -503,7 +543,8 @@ app.post('/api/download/start', rateLimit('start', 10, 60 * 1000), (req, res) =>
     totalStages: hasAudio ? 1 : 2,
     cancelled: false,
     child: null,
-    createdAt: Date.now()
+    createdAt: Date.now(),
+    transferring: false
   };
 
   jobs.set(id, job);
@@ -539,11 +580,17 @@ app.get('/api/download/:id/progress', (req, res) => {
 
 app.get('/api/download/:id/file', (req, res) => {
   const job = UUID_PATTERN.test(req.params.id) ? jobs.get(req.params.id) : null;
+
   if (!job || job.status !== 'done' || !job.filePath) {
     return res.status(404).json({ error: 'File not available.' });
   }
 
+  if (job.transferring) {
+    return res.status(409).json({ error: 'File transfer already in progress.' });
+  }
+
   let stat;
+
   try {
     stat = fs.statSync(job.filePath);
   } catch {
@@ -551,30 +598,67 @@ app.get('/api/download/:id/file', (req, res) => {
     return res.status(404).json({ error: 'File not available.' });
   }
 
-  const ext = path.extname(job.filePath).slice(1) || 'mp4';
+  if (stat.size > MAX_DOWNLOAD_BYTES) {
+    removeJobFiles(job.id);
+    jobs.delete(job.id);
+    return res.status(413).json({ error: 'File exceeds the allowed size.' });
+  }
+
+  const ext = path.extname(job.filePath).slice(1).toLowerCase() || 'mp4';
   const asciiName = asciiSafeName(job.title);
   const encodedName = encodeURIComponent(`${job.title}.${ext}`);
+
+  const contentTypes = {
+    mp4: 'video/mp4',
+    webm: 'video/webm',
+    mkv: 'video/x-matroska',
+    mp3: 'audio/mpeg',
+    m4a: 'audio/mp4',
+    opus: 'audio/ogg'
+  };
 
   res.setHeader(
     'Content-Disposition',
     `attachment; filename="${asciiName}.${ext}"; filename*=UTF-8''${encodedName}`
   );
-  res.setHeader('Content-Type', 'video/mp4');
+
+  res.setHeader('Content-Type', contentTypes[ext] || 'application/octet-stream');
   res.setHeader('Content-Length', stat.size);
+  res.setHeader('Cache-Control', 'no-store');
+
+  job.transferring = true;
 
   const readStream = fs.createReadStream(job.filePath);
-  readStream.pipe(res);
+  let completed = false;
 
-  const cleanup = () => {
+  res.once('finish', () => {
+    completed = true;
+    job.transferring = false;
     removeJobFiles(job.id);
     jobs.delete(job.id);
-  };
+    console.log(`Completed transfer and removed temporary files: ${job.id}`);
+  });
 
-  readStream.on('close', cleanup);
-  readStream.on('error', cleanup);
-  req.on('close', cleanup);
+  res.once('close', () => {
+    if (!completed) {
+      job.transferring = false;
+      readStream.destroy();
+      console.log(`Interrupted transfer retained for retry: ${job.id}`);
+    }
+  });
+
+  readStream.once('error', (err) => {
+    job.transferring = false;
+    console.error('File streaming error:', err.message);
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'File transfer failed.' });
+    } else {
+      res.destroy(err);
+    }
+  });
+
+  readStream.pipe(res);
 });
-
 app.delete('/api/download/:id', (req, res) => {
   const job = UUID_PATTERN.test(req.params.id) ? jobs.get(req.params.id) : null;
   if (!job) return res.status(404).json({ error: 'Download not found.' });
@@ -591,7 +675,7 @@ app.delete('/api/download/:id', (req, res) => {
 setInterval(() => {
   const now = Date.now();
   for (const [id, job] of jobs) {
-    if (now - job.createdAt > JOB_TTL_MS) {
+    if (now - job.createdAt > JOB_TTL_MS && !job.transferring) {
       job.cancelled = true;
       if (job.child) job.child.kill('SIGKILL');
       for (const client of job.clients) client.end();
@@ -601,6 +685,26 @@ setInterval(() => {
   }
 }, 60 * 1000).unref();
 
+function cleanupOrphanedFiles() {
+  const now = Date.now();
+  try {
+    for (const file of fs.readdirSync(DOWNLOAD_DIR)) {
+      const fullPath = path.join(DOWNLOAD_DIR, file);
+      const stat = fs.statSync(fullPath);
+      const id = file.split('.')[0];
+      const job = jobs.get(id);
+      if (job && (job.transferring || job.status === 'downloading' || job.status === 'processing')) continue;
+      if (stat.isFile() && now - stat.mtimeMs > JOB_TTL_MS) {
+        fs.rmSync(fullPath, { force: true });
+      }
+    }
+  } catch (err) {
+    console.error('Orphan cleanup error:', err.message);
+  }
+}
+
+cleanupOrphanedFiles();
+setInterval(cleanupOrphanedFiles, 60000).unref();
 checkFfmpeg().then((ok) => {
   ffmpegReady = ok;
   if (!ok) {
@@ -609,3 +713,7 @@ checkFfmpeg().then((ok) => {
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
+
+
+
