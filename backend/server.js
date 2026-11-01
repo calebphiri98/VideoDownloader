@@ -234,7 +234,12 @@ function buildOptions(data) {
   const all = data.formats || [];
   const audio = pickAudio(all);
   const audioSize = audio ? sizeOf(audio, data.duration) : { bytes: null, approx: false };
-  const videos = all.filter((f) => f.vcodec && f.vcodec !== 'none' && !/premium/i.test(f.format_note || ''));
+  const videos = all.filter((f) => {
+    if (/premium/i.test(f.format_note || '')) return false;
+    if (f.vcodec === 'none') return false;
+    if (f.vcodec) return true;
+    return f.ext === 'mp4' && /^https?$/i.test(f.protocol || '');
+  });
 
   const group = (list) => {
     const groups = new Map();
@@ -251,7 +256,8 @@ function buildOptions(data) {
 
   return [...groups.values()]
     .map((f) => {
-      const hasAudio = !!f.acodec && f.acodec !== 'none';
+      const hasAudio = (!!f.acodec && f.acodec !== 'none') ||
+        (!f.acodec && !f.vcodec && f.ext === 'mp4' && /^https?$/i.test(f.protocol || ''));
       const video = sizeOf(f, data.duration);
       let bytes = video.bytes;
       let approx = video.approx;
@@ -759,6 +765,7 @@ checkFfmpeg().then((ok) => {
 });
 
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+
 
 
 
